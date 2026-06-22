@@ -32,6 +32,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import os
 import socket
 import ssl
@@ -40,6 +41,8 @@ import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger("health_check")
 
 # ---------------------------------------------------------------------------
 # CONSTANTS
@@ -64,11 +67,89 @@ DISK_THRESHOLD_CRITICAL = 90
 MEMORY_THRESHOLD_WARNING = 80
 MEMORY_THRESHOLD_CRITICAL = 90
 
+# Retry / backoff / circuit-breaker defaults for flaky HTTP endpoints.
+DEFAULT_MAX_RETRIES = 2          # extra attempts after the first (3 tries total)
+DEFAULT_BASE_DELAY = 0.5         # seconds; first backoff delay
+DEFAULT_BACKOFF_FACTOR = 2.0     # delay = base_delay * (backoff_factor ** attempt)
+DEFAULT_CIRCUIT_THRESHOLD = 5    # consecutive failures before the circuit opens
+DEFAULT_CIRCUIT_COOLDOWN = 30.0  # seconds the circuit stays open before a trial
+
+
+# ---------------------------------------------------------------------------
+# CIRCUIT BREAKER
+# ---------------------------------------------------------------------------
+
+class CircuitBreaker:
+    """
+    Per-endpoint circuit breaker that prevents hammering a failing service.
+
+    State transitions (keyed independently per endpoint):
+
+        CLOSED   --(>= threshold consecutive failures)-->  OPEN
+        OPEN     --(cooldown elapsed)-------------------->  HALF_OPEN
+        HALF_OPEN --(success)--------------------------->  CLOSED
+        HALF_OPEN --(failure)--------------------------->  OPEN (cooldown restarts)
+
+    While a circuit is OPEN the caller should skip the probe entirely rather
+    than issue a request that is very likely to fail. After the cooldown the
+    circuit becomes HALF_OPEN and a single trial request is allowed through to
+    decide whether the endpoint has recovered.
+
+    ``time_func`` is injectable so tests can advance time deterministically.
+    """
+
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+    def __init__(
+        self,
+        threshold: int = DEFAULT_CIRCUIT_THRESHOLD,
+        cooldown: float = DEFAULT_CIRCUIT_COOLDOWN,
+        time_func=time.monotonic,
+    ):
+        if threshold < 1:
+            raise ValueError("circuit threshold must be >= 1")
+        if cooldown < 0:
+            raise ValueError("circuit cooldown must be >= 0")
+        self.threshold = threshold
+        self.cooldown = cooldown
+        self._time = time_func
+        self._failures: Dict[str, int] = {}
+        self._opened_at: Dict[str, float] = {}
+
+    def state(self, key: str) -> str:
+        """Return the current circuit state for ``key``."""
+        if key not in self._opened_at:
+            return self.CLOSED
+        if self._time() - self._opened_at[key] >= self.cooldown:
+            return self.HALF_OPEN
+        return self.OPEN
+
+    def allows_request(self, key: str) -> bool:
+        """True unless the circuit is fully OPEN (within its cooldown)."""
+        return self.state(key) != self.OPEN
+
+    def record_success(self, key: str) -> None:
+        """Reset the circuit for ``key`` after a successful probe."""
+        self._failures.pop(key, None)
+        self._opened_at.pop(key, None)
+
+    def record_failure(self, key: str) -> None:
+        """Register a failed probe; opens the circuit at the threshold."""
+        self._failures[key] = self._failures.get(key, 0) + 1
+        if self._failures[key] >= self.threshold:
+            self._opened_at[key] = self._time()
+
+    def failure_count(self, key: str) -> int:
+        return self._failures.get(key, 0)
+
 # ---------------------------------------------------------------------------
 # CHECK FUNCTIONS
 # ---------------------------------------------------------------------------
 
-def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
+def _single_http_probe(host: str, port: int, path: str, timeout: int) -> Tuple[str, str, int]:
+    """Perform a single HTTP probe (no retry). Returns (status, detail, code)."""
     import http.client
     try:
         conn = http.client.HTTPConnection(host, port, timeout=timeout)
@@ -91,6 +172,80 @@ def check_http_service(host: str, port: int, path: str, timeout: int) -> Tuple[s
         return result, detail, status
     except Exception as e:
         return "CRITICAL", str(e), 0
+
+
+def check_http_service(
+    host: str,
+    port: int,
+    path: str,
+    timeout: int,
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+    circuit_breaker: Optional[CircuitBreaker] = None,
+    sleep_func=time.sleep,
+) -> Tuple[str, str, int]:
+    """
+    Probe an HTTP health endpoint with retry, exponential backoff, and an
+    optional circuit breaker.
+
+    Retry policy:
+      - A CRITICAL result (connection error or HTTP 5xx) is retried up to
+        ``max_retries`` additional times.
+      - A reachable response (OK, or a 4xx WARNING) is returned immediately —
+        the service answered, so retrying would not help.
+      - Backoff before attempt ``n`` (0-indexed) is
+        ``base_delay * (backoff_factor ** n)`` seconds.
+
+    Circuit breaker:
+      - When the breaker is OPEN for this endpoint the probe is skipped and a
+        CRITICAL "circuit open" result is returned, so a known-bad service is
+        not hammered.
+      - A reachable response resets the breaker; exhausting all retries records
+        a failure that may open it.
+
+    ``sleep_func`` is injectable so tests need not wait on real time.
+    """
+    key = f"{host}:{port}"
+
+    if circuit_breaker is not None and not circuit_breaker.allows_request(key):
+        logger.warning("circuit OPEN for %s — skipping probe to avoid hammering", key)
+        return "CRITICAL", "Circuit open — probe skipped (cooldown active)", 0
+
+    attempts = max(1, max_retries + 1)
+    result, detail, code = "CRITICAL", "no attempt made", 0
+
+    for attempt in range(attempts):
+        result, detail, code = _single_http_probe(host, port, path, timeout)
+
+        # Any non-CRITICAL outcome means the service responded — treat the
+        # endpoint as reachable, reset the breaker, and stop retrying.
+        if result != "CRITICAL":
+            if circuit_breaker is not None:
+                circuit_breaker.record_success(key)
+            return result, detail, code
+
+        if attempt < attempts - 1:
+            delay = base_delay * (backoff_factor ** attempt)
+            logger.warning(
+                "probe %s failed (attempt %d/%d): %s — retrying in %.2fs",
+                key, attempt + 1, attempts, detail, delay,
+            )
+            sleep_func(delay)
+
+    # All attempts exhausted: the endpoint is degraded/unreachable.
+    if circuit_breaker is not None:
+        circuit_breaker.record_failure(key)
+        if not circuit_breaker.allows_request(key):
+            logger.warning(
+                "circuit OPENED for %s after %d consecutive failures",
+                key, circuit_breaker.threshold,
+            )
+    logger.warning(
+        "probe %s degraded: %s (after %d attempt(s))", key, detail, attempts
+    )
+    return result, detail, code
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
@@ -200,7 +355,15 @@ def check_load_average() -> Tuple[str, str, float]:
 # HEALTH CHECK RUNNER
 # ---------------------------------------------------------------------------
 
-def run_health_checks(service: Optional[str] = None, json_output: bool = False) -> Dict[str, Any]:
+def run_health_checks(
+    service: Optional[str] = None,
+    json_output: bool = False,
+    *,
+    max_retries: int = DEFAULT_MAX_RETRIES,
+    base_delay: float = DEFAULT_BASE_DELAY,
+    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
+    circuit_breaker: Optional[CircuitBreaker] = None,
+) -> Dict[str, Any]:
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -217,7 +380,11 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
         if service and name != service:
             continue
         status, detail, code = check_http_service(
-            config["host"], config["port"], config["path"], config["timeout"]
+            config["host"], config["port"], config["path"], config["timeout"],
+            max_retries=max_retries,
+            base_delay=base_delay,
+            backoff_factor=backoff_factor,
+            circuit_breaker=circuit_breaker,
         )
         results["services"][name] = {
             "status": status,
@@ -270,8 +437,57 @@ def run_health_checks(service: Optional[str] = None, json_output: bool = False) 
                 all_ok = False
 
     results["overall_status"] = "OK" if all_ok else "DEGRADED"
+    results["summary"] = summarize_results(results)
+
+    if results["overall_status"] == "DEGRADED":
+        logger.warning(
+            "overall status DEGRADED — %d critical, %d warning of %d checks",
+            results["summary"]["critical"],
+            results["summary"]["warning"],
+            results["summary"]["total_checks"],
+        )
 
     return results
+
+
+def summarize_results(results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Aggregate per-check statuses into summary stats.
+
+    Walks services, infrastructure, and system (including nested checks such
+    as a service's certificate block) and counts OK/WARNING/CRITICAL, listing
+    every non-OK check under ``degraded``.
+    """
+    counts = {"OK": 0, "WARNING": 0, "CRITICAL": 0}
+    degraded: List[str] = []
+
+    def _tally(label: str, check: Dict[str, Any]) -> None:
+        status = check.get("status")
+        if status in counts:
+            counts[status] += 1
+            if status != "OK":
+                degraded.append(f"{label}: {status}")
+
+    for category in ("services", "infrastructure", "system"):
+        for name, check in results.get(category, {}).items():
+            if not isinstance(check, dict):
+                continue
+            if "status" in check:
+                _tally(f"{category}/{name}", check)
+            # Nested checks (e.g. services[name]["certificate"]).
+            for sub_name, sub_check in check.items():
+                if isinstance(sub_check, dict) and "status" in sub_check:
+                    _tally(f"{category}/{name}.{sub_name}", sub_check)
+
+    total = sum(counts.values())
+    return {
+        "total_checks": total,
+        "ok": counts["OK"],
+        "warning": counts["WARNING"],
+        "critical": counts["CRITICAL"],
+        "healthy_pct": round(counts["OK"] / total * 100, 1) if total else 0.0,
+        "degraded": degraded,
+    }
 
 
 def print_health_report(results: Dict[str, Any]):
@@ -297,6 +513,16 @@ def print_health_report(results: Dict[str, Any]):
                         if isinstance(sub_check, dict) and "status" in sub_check:
                             sub_icon = {"OK": "✓", "WARNING": "⚠", "CRITICAL": "✗"}.get(sub_check["status"], "?")
                             print(f"      {sub_icon} {sub_name}: {sub_check['detail']}")
+
+    summary = results.get("summary")
+    if summary:
+        print(f"\n  Summary: {summary['ok']} OK · {summary['warning']} WARNING · "
+              f"{summary['critical']} CRITICAL "
+              f"({summary['healthy_pct']:.0f}% healthy of {summary['total_checks']} checks)")
+        if summary["degraded"]:
+            print("  Degraded:")
+            for item in summary["degraded"]:
+                print(f"    - {item}")
     print()
 
 
@@ -307,17 +533,58 @@ def parse_args():
     parser.add_argument("--watch", "-w", action="store_true", help="Continuous monitoring")
     parser.add_argument("--interval", "-i", type=int, default=30, help="Check interval in seconds")
     parser.add_argument("--output", "-o", help="Output file path")
+    parser.add_argument(
+        "--max-retries", type=int, default=DEFAULT_MAX_RETRIES,
+        help="Extra HTTP probe attempts after the first on failure",
+    )
+    parser.add_argument(
+        "--base-delay", type=float, default=DEFAULT_BASE_DELAY,
+        help="Base backoff delay in seconds",
+    )
+    parser.add_argument(
+        "--backoff-factor", type=float, default=DEFAULT_BACKOFF_FACTOR,
+        help="Exponential backoff factor: delay = base_delay * (factor ** attempt)",
+    )
+    parser.add_argument(
+        "--circuit-threshold", type=int, default=DEFAULT_CIRCUIT_THRESHOLD,
+        help="Consecutive failures before the circuit breaker opens",
+    )
+    parser.add_argument(
+        "--circuit-cooldown", type=float, default=DEFAULT_CIRCUIT_COOLDOWN,
+        help="Seconds the circuit stays open before allowing a trial probe",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true",
+        help="Enable INFO-level logging (WARNING is always shown)",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
 
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    circuit_breaker = CircuitBreaker(
+        threshold=args.circuit_threshold,
+        cooldown=args.circuit_cooldown,
+    )
+
+    probe_kwargs = dict(
+        max_retries=args.max_retries,
+        base_delay=args.base_delay,
+        backoff_factor=args.backoff_factor,
+        circuit_breaker=circuit_breaker,
+    )
+
     if args.watch:
         print(f"Continuous monitoring (interval: {args.interval}s). Press Ctrl+C to stop.")
         try:
             while True:
-                results = run_health_checks(args.service, args.json)
+                results = run_health_checks(args.service, args.json, **probe_kwargs)
                 if args.json:
                     print(json.dumps(results, indent=2))
                 else:
@@ -326,7 +593,7 @@ def main():
         except KeyboardInterrupt:
             print("\nMonitoring stopped")
     else:
-        results = run_health_checks(args.service, args.json)
+        results = run_health_checks(args.service, args.json, **probe_kwargs)
         if args.json:
             output = json.dumps(results, indent=2)
             print(output)
