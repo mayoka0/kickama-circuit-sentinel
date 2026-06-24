@@ -32,10 +32,14 @@ hc.logger.propagate = False
 
 # A small recorder so tests can assert on backoff delays without sleeping.
 class _SleepRecorder:
+    """Stand-in for ``time.sleep`` that records requested delays instead of waiting."""
+
     def __init__(self):
+        """Start with an empty list of recorded delays."""
         self.delays = []
 
     def __call__(self, seconds):
+        """Record a requested sleep duration without blocking."""
         self.delays.append(seconds)
 
 
@@ -43,12 +47,15 @@ class _FakeClock:
     """Manually advanceable monotonic clock for circuit-breaker timing."""
 
     def __init__(self, now=1000.0):
+        """Initialise the clock at ``now`` seconds."""
         self.now = now
 
     def __call__(self):
+        """Return the current (fake) time."""
         return self.now
 
     def advance(self, seconds):
+        """Move the clock forward by ``seconds``."""
         self.now += seconds
 
 
@@ -57,6 +64,7 @@ def _probe_returning(*results):
     seq = iter(results)
 
     def fake_probe(host, port, path, timeout):
+        """Return the next scripted probe result, ignoring the arguments."""
         return next(seq)
 
     return fake_probe
@@ -73,7 +81,10 @@ SERVER_ERR = ("CRITICAL", "HTTP 503", 503)
 # =============================================================================
 
 class TestRetryBackoff(unittest.TestCase):
+    """Retry loop and exponential-backoff behaviour of ``check_http_service``."""
+
     def test_retry_succeeds_after_transient_failures(self):
+        """Transient CRITICALs are retried until an OK is returned."""
         sleeper = _SleepRecorder()
         with mock.patch.object(hc, "_single_http_probe",
                                _probe_returning(CRIT, CRIT, OK)):
@@ -87,6 +98,7 @@ class TestRetryBackoff(unittest.TestCase):
         self.assertEqual(sleeper.delays, [0.5, 1.0])
 
     def test_backoff_delay_formula(self):
+        """Backoff delays follow base_delay * factor**attempt across retries."""
         sleeper = _SleepRecorder()
         with mock.patch.object(hc, "_single_http_probe",
                                _probe_returning(CRIT, CRIT, CRIT, CRIT)):
@@ -98,6 +110,7 @@ class TestRetryBackoff(unittest.TestCase):
         self.assertEqual(sleeper.delays, [0.5, 1.0, 2.0])
 
     def test_exhausting_retries_returns_critical(self):
+        """When every attempt fails the final result is CRITICAL."""
         sleeper = _SleepRecorder()
         with mock.patch.object(hc, "_single_http_probe",
                                _probe_returning(CRIT, CRIT, CRIT)):
@@ -121,6 +134,7 @@ class TestRetryBackoff(unittest.TestCase):
         self.assertEqual(sleeper.delays, [])
 
     def test_server_error_is_retried(self):
+        """A 5xx CRITICAL is retried and can recover to OK."""
         sleeper = _SleepRecorder()
         with mock.patch.object(hc, "_single_http_probe",
                                _probe_returning(SERVER_ERR, OK)):
@@ -136,7 +150,10 @@ class TestRetryBackoff(unittest.TestCase):
 # =============================================================================
 
 class TestCircuitBreaker(unittest.TestCase):
+    """State machine and probe short-circuiting of ``CircuitBreaker``."""
+
     def test_opens_after_threshold_consecutive_failures(self):
+        """The circuit opens once consecutive failures reach the threshold."""
         cb = hc.CircuitBreaker(threshold=3, cooldown=30.0, time_func=_FakeClock())
         key = "h:1"
         cb.record_failure(key)
@@ -148,6 +165,7 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertFalse(cb.allows_request(key))
 
     def test_half_open_after_cooldown(self):
+        """After the cooldown elapses the circuit becomes HALF_OPEN and allows a trial."""
         clock = _FakeClock()
         cb = hc.CircuitBreaker(threshold=2, cooldown=30.0, time_func=clock)
         key = "h:1"
@@ -159,6 +177,7 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertTrue(cb.allows_request(key))  # trial allowed
 
     def test_success_resets_circuit(self):
+        """A success closes the circuit and clears the failure count."""
         cb = hc.CircuitBreaker(threshold=2, cooldown=30.0, time_func=_FakeClock())
         key = "h:1"
         cb.record_failure(key)
@@ -184,6 +203,7 @@ class TestCircuitBreaker(unittest.TestCase):
         probe.assert_not_called()
 
     def test_exhausted_probe_opens_circuit(self):
+        """Exhausting all probe attempts records a failure that opens the circuit."""
         clock = _FakeClock()
         cb = hc.CircuitBreaker(threshold=1, cooldown=30.0, time_func=clock)
         with mock.patch.object(hc, "_single_http_probe",
@@ -195,6 +215,7 @@ class TestCircuitBreaker(unittest.TestCase):
         self.assertEqual(cb.state("h:1"), cb.OPEN)
 
     def test_invalid_threshold_rejected(self):
+        """Constructing a breaker with threshold < 1 raises ValueError."""
         with self.assertRaises(ValueError):
             hc.CircuitBreaker(threshold=0)
 
@@ -204,7 +225,10 @@ class TestCircuitBreaker(unittest.TestCase):
 # =============================================================================
 
 class TestSummarize(unittest.TestCase):
+    """Aggregation and degraded-list construction of ``summarize_results``."""
+
     def test_summarize_counts_and_degraded(self):
+        """Counts OK/WARNING/CRITICAL and lists every non-OK check as degraded."""
         results = {
             "services": {
                 "backend": {"status": "OK", "detail": ""},
@@ -227,6 +251,7 @@ class TestSummarize(unittest.TestCase):
         self.assertIn("infrastructure/redis: WARNING", summary["degraded"])
 
     def test_summarize_includes_nested_certificate_check(self):
+        """Nested checks such as a service's certificate block are counted too."""
         results = {
             "services": {
                 "frontend": {

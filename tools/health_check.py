@@ -108,6 +108,7 @@ class CircuitBreaker:
         cooldown: float = DEFAULT_CIRCUIT_COOLDOWN,
         time_func=time.monotonic,
     ):
+        """Configure thresholds and inject a clock (``time_func``) for timing."""
         if threshold < 1:
             raise ValueError("circuit threshold must be >= 1")
         if cooldown < 0:
@@ -142,6 +143,7 @@ class CircuitBreaker:
             self._opened_at[key] = self._time()
 
     def failure_count(self, key: str) -> int:
+        """Return the number of consecutive failures recorded for ``key``."""
         return self._failures.get(key, 0)
 
 # ---------------------------------------------------------------------------
@@ -249,6 +251,7 @@ def check_http_service(
 
 
 def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]:
+    """Open a TCP connection to ``host:port``; returns (status, detail, latency_ms)."""
     try:
         start = time.time()
         sock = socket.create_connection((host, port), timeout=timeout)
@@ -264,6 +267,11 @@ def check_tcp_port(host: str, port: int, timeout: int) -> Tuple[str, str, float]
 
 
 def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]:
+    """Inspect the TLS certificate of ``host:port``; warns/critical as expiry nears.
+
+    Returns (status, detail, days_remaining). OK > 30 days, WARNING > 7 days,
+    CRITICAL otherwise.
+    """
     try:
         ctx = ssl.create_default_context()
         with socket.create_connection((host, port), timeout=10) as sock:
@@ -287,6 +295,10 @@ def check_certificate_expiry(host: str, port: int = 443) -> Tuple[str, str, int]
 
 
 def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
+    """Check filesystem usage at ``path`` against the warning/critical thresholds.
+
+    Returns (status, detail, used_percent).
+    """
     try:
         stat = os.statvfs(path)
         total = stat.f_frsize * stat.f_blocks
@@ -305,6 +317,10 @@ def check_disk_usage(path: str = "/") -> Tuple[str, str, float]:
 
 
 def check_memory_usage() -> Tuple[str, str, float]:
+    """Read ``/proc/meminfo`` and report memory usage against the thresholds.
+
+    Returns (status, detail, used_percent).
+    """
     try:
         with open("/proc/meminfo") as f:
             meminfo = {}
@@ -334,6 +350,10 @@ def check_memory_usage() -> Tuple[str, str, float]:
 
 
 def check_load_average() -> Tuple[str, str, float]:
+    """Read ``/proc/loadavg`` and report the 1-minute load relative to CPU count.
+
+    Returns (status, detail, load_average).
+    """
     try:
         with open("/proc/loadavg") as f:
             parts = f.read().strip().split()
@@ -364,6 +384,13 @@ def run_health_checks(
     backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
     circuit_breaker: Optional[CircuitBreaker] = None,
 ) -> Dict[str, Any]:
+    """Run every health check and return a structured results dict.
+
+    Probes services (HTTP, with the shared retry/backoff/circuit-breaker
+    settings), infrastructure (TCP), and system resources, then attaches a
+    ``summary`` and an ``overall_status`` of ``OK`` or ``DEGRADED``. When
+    ``service`` is given, only that named target is checked.
+    """
     results: Dict[str, Any] = {
         "timestamp": datetime.now().isoformat(),
         "hostname": socket.gethostname(),
@@ -462,6 +489,7 @@ def summarize_results(results: Dict[str, Any]) -> Dict[str, Any]:
     degraded: List[str] = []
 
     def _tally(label: str, check: Dict[str, Any]) -> None:
+        """Count one check's status and record it under ``degraded`` if non-OK."""
         status = check.get("status")
         if status in counts:
             counts[status] += 1
@@ -491,6 +519,7 @@ def summarize_results(results: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def print_health_report(results: Dict[str, Any]):
+    """Pretty-print a human-readable health report (with summary) to stdout."""
     print(f"\n{'='*60}")
     print(f"  HEALTH CHECK REPORT")
     print(f"  Host: {results['hostname']}")
@@ -527,6 +556,7 @@ def print_health_report(results: Dict[str, Any]):
 
 
 def parse_args():
+    """Define and parse the command-line interface; returns the parsed args."""
     parser = argparse.ArgumentParser(description="Health check tool")
     parser.add_argument("--service", "-s", help="Check specific service only")
     parser.add_argument("--json", "-j", action="store_true", help="JSON output")
@@ -561,6 +591,7 @@ def parse_args():
 
 
 def main():
+    """CLI entry point: configure logging, run checks (or watch), return exit code."""
     args = parse_args()
 
     logging.basicConfig(
