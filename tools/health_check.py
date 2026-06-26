@@ -36,8 +36,6 @@ import logging
 import os
 import socket
 import ssl
-import subprocess
-import sys
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -521,7 +519,7 @@ def summarize_results(results: Dict[str, Any]) -> Dict[str, Any]:
 def print_health_report(results: Dict[str, Any]):
     """Pretty-print a human-readable health report (with summary) to stdout."""
     print(f"\n{'='*60}")
-    print(f"  HEALTH CHECK REPORT")
+    print("  HEALTH CHECK REPORT")
     print(f"  Host: {results['hostname']}")
     print(f"  Time: {results['timestamp']}")
     print(f"  Overall: {results['overall_status']}")
